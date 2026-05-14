@@ -1,9 +1,7 @@
 #!/bin/bash
 set -e
 
-# === Проверка поддержки терминала ===
 if [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
-    echo "Your terminal does not support color formatting. Using basic mode."
     BLUE=""
     CYAN=""
     GREEN=""
@@ -26,11 +24,14 @@ fi
 center_title() {
     local title="$1"
     local title_length=${#title}
-    local width=$(tput cols 2>/dev/null || echo 50)
-    [ $width -lt $((title_length + 4)) ] && width=$((title_length + 4))
+    local width
+    width=$(tput cols 2>/dev/null || echo 50)
+    [ "$width" -lt $((title_length + 4)) ] && width=$((title_length + 4))
     local padding=$(( (width - title_length) / 2 ))
-    local left_padding=$(printf "%${padding}s" | tr ' ' '-')
-    local right_padding=$(printf "%${padding}s" | tr ' ' '-')
+    local left_padding
+    left_padding=$(printf "%${padding}s" | tr ' ' '-')
+    local right_padding
+    right_padding=$(printf "%${padding}s" | tr ' ' '-')
     [ $(( (width - title_length) % 2 )) -ne 0 ] && right_padding="${right_padding}-"
     echo "${left_padding}${title}${right_padding}"
 }
@@ -39,89 +40,176 @@ spinner() {
     local pid=$1
     local delay=0.1
     local spinstr='|/-\'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+    while kill -0 "$pid" 2>/dev/null; do
         local temp=${spinstr#?}
         printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
+        spinstr=$temp${spinstr%"$temp"}
         sleep $delay
         printf "\b\b\b\b\b\b"
     done
     printf "    \b\b\b\b"
 }
 
-LOG_DIR="Heroku"
-LOG_FILE="$LOG_DIR/heroku_installer.log"
-apt install curl
-mkdir -p "$LOG_DIR"
+run_bg() {
+    "$@" &>> "$LOG_FILE" &
+    spinner $!
+    wait $! || { echo -e "${RED}Error during: $*${RESET}"; echo "See $LOG_FILE for details."; exit 1; }
+}
+
+APT="apt-get"
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo &>/dev/null; then
+        APT="sudo apt-get"
+    else
+        echo -e "${RED}Run as root or install sudo.${RESET}"
+        exit 1
+    fi
+fi
+
+INSTALL_DIR="$HOME/Heroku"
+LOG_FILE="/tmp/heroku_installer.log"
+
+clone_or_pull() {
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        echo -e "${YELLOW}Heroku directory already exists. Pulling latest...${RESET}"
+        run_bg git -C "$INSTALL_DIR" pull
+    else
+        run_bg git clone https://github.com/coddrago/Heroku "$INSTALL_DIR"
+    fi
+}
+
+setup_systemd() {
+    local exec_start="$1"
+    local current_user
+    current_user=$(id -un)
+    local service_file="/etc/systemd/system/heroku.service"
+
+    cat > "$service_file" <<EOF
+[Unit]
+Description=Heroku service
+After=network.target
+
+[Service]
+User=${current_user}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${exec_start}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable heroku
+    systemctl restart heroku
+    echo -e "${GREEN}Systemd service installed and started.${RESET}"
+    echo -e "${CYAN}Logs: journalctl -u heroku -f${RESET}"
+}
 
 while true; do
     clear
     echo -e "${PURPLE}${BOLD}"
-    curl -s https://raw.githubusercontent.com/coddrago/Heroku/refs/heads/dev-test/assets/download.txt   
+    curl -fsSL https://raw.githubusercontent.com/coddrago/Heroku/refs/heads/master/assets/download.txt 2>/dev/null || true
     echo -e "${RESET}"
     echo -e "${CYAN}${BOLD}$(center_title 'Menu')${RESET}"
     echo -e "${BLUE}1. Install Heroku${RESET}"
     echo -e "${BLUE}2. Install Heroku in venv${RESET}"
     echo -e "${BLUE}3. Install Heroku in Docker${RESET}"
-    echo -e "${BLUE}4. Remove Heroku${RESET}"
+    echo -e "${BLUE}4. Install Heroku as systemd service${RESET}"
+    echo -e "${BLUE}5. Install Heroku in venv as systemd service${RESET}"
+    echo -e "${BLUE}6. Remove Heroku${RESET}"
     echo -e "${BLUE}0. Exit${RESET}"
     echo -e "${CYAN}$(center_title '')${RESET}"
-    read -p $'\033[33m> \033[0m ' choice
+    read -r -p $'\033[33m> \033[0m ' choice
 
     case $choice in
         1)
             echo -e "${GREEN}Installing Heroku...${RESET}"
-            (apt-get update && apt-get install -y git python3 python3-pip) &>> "$LOG_FILE" & spinner $!
-            if [ -d "Heroku" ]; then
-                echo -e "${YELLOW}Heroku directory already exists. Skipping clone.${RESET}"
-            else
-                git clone https://github.com/coddrago/Heroku &>> "$LOG_FILE" & spinner $!
-            fi
-            cd Heroku
-            pip3 install -r requirements.txt &>> "$LOG_FILE" & spinner $!
-            python3 -m heroku &>> "$LOG_FILE" & spinner $!
-            echo -e "${GREEN}Completed successfully!${RESET}"
-            read -p $'\033[33mPress Enter to continue... \033[0m'
-            cd ..
+            run_bg $APT update
+            run_bg $APT install -y git python3 python3-pip
+            clone_or_pull
+            run_bg pip3 install -r "$INSTALL_DIR/requirements.txt"
+            echo -e "${GREEN}Starting Heroku...${RESET}"
+            python3 -m heroku --chdir "$INSTALL_DIR"
+            read -r -p $'\033[33mPress Enter to continue... \033[0m'
             ;;
         2)
             echo -e "${GREEN}Installing Heroku in venv...${RESET}"
-            (apt-get update && apt-get install -y git python3 python3-pip python3-venv) &>> "$LOG_FILE" & spinner $!
-            if [ -d "Heroku" ]; then
-                echo -e "${YELLOW}Heroku directory already exists. Skipping clone.${RESET}"
-            else
-                git clone https://github.com/coddrago/Heroku &>> "$LOG_FILE" & spinner $!
+            run_bg $APT update
+            run_bg $APT install -y git python3 python3-pip python3-venv
+            clone_or_pull
+            if [ ! -d "$INSTALL_DIR/.venv" ]; then
+                python3 -m venv "$INSTALL_DIR/.venv"
             fi
-            cd Heroku
-            python3 -m venv Heroku_UB
-            source Heroku_UB/bin/activate
-            pip install -r requirements.txt &>> "$LOG_FILE" & spinner $!
-            python3 -m heroku &>> "$LOG_FILE" & spinner $!
-            echo -e "${GREEN}Completed successfully!${RESET}"
-            read -p $'\033[33mPress Enter to continue... \033[0m'
-            cd ..
+            run_bg "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
+            echo -e "${GREEN}Starting Heroku...${RESET}"
+            "$INSTALL_DIR/.venv/bin/python3" -m heroku --chdir "$INSTALL_DIR"
+            read -r -p $'\033[33mPress Enter to continue... \033[0m'
             ;;
         3)
             echo -e "${GREEN}Installing Heroku in Docker...${RESET}"
-            (apt-get update && apt-get install curl -y) &>> "$LOG_FILE" & spinner $!
-            bash <(curl -s https://raw.githubusercontent.com/coddrago/Heroku/refs/heads/master/docker.sh) &>> "$LOG_FILE" & spinner $!
+            run_bg $APT update
+            run_bg $APT install -y curl
+            bash <(curl -fsSL https://raw.githubusercontent.com/coddrago/Heroku/refs/heads/master/docker.sh)
             echo -e "${GREEN}Completed successfully!${RESET}"
-            read -p $'\033[33mPress Enter to continue... \033[0m'
+            read -r -p $'\033[33mPress Enter to continue... \033[0m'
             ;;
         4)
+            if ! command -v systemctl &>/dev/null; then
+                echo -e "${RED}systemd is not available on this system.${RESET}"
+                read -r -p $'\033[33mPress Enter to continue... \033[0m'
+                continue
+            fi
+            echo -e "${GREEN}Installing Heroku as systemd service...${RESET}"
+            run_bg $APT update
+            run_bg $APT install -y git python3 python3-pip
+            clone_or_pull
+            run_bg pip3 install -r "$INSTALL_DIR/requirements.txt"
+            echo -e "${YELLOW}First launch for login (Ctrl+C when done to continue):${RESET}"
+            python3 -m heroku --chdir "$INSTALL_DIR" || true
+            setup_systemd "$(command -v python3) -m heroku"
+            read -r -p $'\033[33mPress Enter to continue... \033[0m'
+            ;;
+        5)
+            if ! command -v systemctl &>/dev/null; then
+                echo -e "${RED}systemd is not available on this system.${RESET}"
+                read -r -p $'\033[33mPress Enter to continue... \033[0m'
+                continue
+            fi
+            echo -e "${GREEN}Installing Heroku in venv as systemd service...${RESET}"
+            run_bg $APT update
+            run_bg $APT install -y git python3 python3-pip python3-venv
+            clone_or_pull
+            if [ ! -d "$INSTALL_DIR/.venv" ]; then
+                python3 -m venv "$INSTALL_DIR/.venv"
+            fi
+            run_bg "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
+            echo -e "${YELLOW}First launch for login (Ctrl+C when done to continue):${RESET}"
+            "$INSTALL_DIR/.venv/bin/python3" -m heroku --chdir "$INSTALL_DIR" || true
+            setup_systemd "$INSTALL_DIR/.venv/bin/python3 -m heroku"
+            read -r -p $'\033[33mPress Enter to continue... \033[0m'
+            ;;
+        6)
             echo -e "${RED}Removing Heroku...${RESET}"
-            rm -rf Heroku &>> "$LOG_FILE"
-            docker stop heroku_ub &>> "$LOG_FILE" || true
-            docker rm -f heroku_ub &>> "$LOG_FILE" || true
+            if command -v systemctl &>/dev/null; then
+                systemctl stop heroku 2>/dev/null || true
+                systemctl disable heroku 2>/dev/null || true
+                rm -f /etc/systemd/system/heroku.service
+                systemctl daemon-reload
+            fi
+            rm -rf "$INSTALL_DIR"
+            docker stop heroku_ub 2>/dev/null || true
+            docker rm -f heroku_ub 2>/dev/null || true
             echo -e "${GREEN}Completed successfully!${RESET}"
-            read -p $'\033[33mPress Enter to continue... \033[0m'
+            read -r -p $'\033[33mPress Enter to continue... \033[0m'
             ;;
         0)
             exit 0
             ;;
-        *)
+        *) 
             echo -e "${RED}Invalid choice!${RESET}"
-            read -p $'\033[33mPress Enter to continue... \033[0m'
+            read -r -p $'\033[33mPress Enter to continue... \033[0m'
             ;;
     esac
 done
